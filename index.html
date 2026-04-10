@@ -76,16 +76,14 @@
 
         // ── Config ────────────────────────────────────────────────────────
 
-        // Breaks calibrated to actual Wichita distribution
-        // (median ~$810K/acre, 25th pct ~$416K, 75th pct ~$1.23M)
-        // Breaks calibrated to assessed values (residential = 11.5% of appraised, commercial = 25%)
-        const BREAKS = [
-            { max:     15000, color: '#ffffb2', label: '< $15K' },
-            { max:     50000, color: '#fecc5c', label: '$15K – $50K' },
-            { max:    100000, color: '#fd8d3c', label: '$50K – $100K' },
-            { max:    175000, color: '#f03b20', label: '$100K – $175K' },
-            { max:    300000, color: '#bd0026', label: '$175K – $300K' },
-            { max:   Infinity, color: '#7f0000', label: '> $300K' },
+        // Dynamic gradient — interpolated across actual log min/max at render time
+        const GRADIENT = [
+            [255, 255, 178],  // #ffffb2
+            [254, 204,  92],  // #fecc5c
+            [253, 141,  60],  // #fd8d3c
+            [240,  59,  32],  // #f03b20
+            [189,   0,  38],  // #bd0026
+            [127,   0,   0],  // #7f0000
         ];
         const NO_DATA_COLOR = '#cccccc';
 
@@ -117,11 +115,17 @@
         // ── Color ─────────────────────────────────────────────────────────
 
         function getColor(vpa) {
-            if (vpa == null || isNaN(vpa) || vpa <= 0) return NO_DATA_COLOR;
-            for (const b of BREAKS) {
-                if (vpa < b.max) return b.color;
-            }
-            return BREAKS[BREAKS.length - 1].color;
+            if (vpa == null || isNaN(vpa) || vpa <= 0 || vpaLogMin == null) return NO_DATA_COLOR;
+            const t = Math.max(0, Math.min(1, (Math.log10(vpa) - vpaLogMin) / (vpaLogMax - vpaLogMin)));
+            const scaled = t * (GRADIENT.length - 1);
+            const i = Math.floor(scaled);
+            const f = scaled - i;
+            const c1 = GRADIENT[Math.min(i, GRADIENT.length - 1)];
+            const c2 = GRADIENT[Math.min(i + 1, GRADIENT.length - 1)];
+            const r = Math.round(c1[0] + f * (c2[0] - c1[0]));
+            const g = Math.round(c1[1] + f * (c2[1] - c1[1]));
+            const b = Math.round(c1[2] + f * (c2[2] - c1[2]));
+            return `rgb(${r},${g},${b})`;
         }
 
 
@@ -135,6 +139,7 @@
 
             const districtNums = new Set();
             let count = 0;
+            let minVpa = Infinity, maxVpa = -Infinity;
 
             for await (const feature of flatgeobuf.deserialize(response.body)) {
                 const p = feature.properties;
@@ -147,6 +152,11 @@
                 const sqft = p.ParcSqFTC || (p.ParcAcresC ? p.ParcAcresC * 43560 : null);
                 p._vpsf = (sqft && sqft > 0 && p.assTotal > 0) ? p.assTotal / sqft : null;
 
+                if (p._vpa > 0) {
+                    if (p._vpa < minVpa) minVpa = p._vpa;
+                    if (p._vpa > maxVpa) maxVpa = p._vpa;
+                }
+
                 if (p.district) districtNums.add(p.district);
                 allFeatures.push(feature);
                 count++;
@@ -155,6 +165,10 @@
                     setStatus(`Loading... ${count.toLocaleString()} parcels`);
                 }
             }
+
+            // Set log scale bounds before rendering so getColor works immediately
+            vpaLogMin = Math.log10(minVpa);
+            vpaLogMax = Math.log10(maxVpa);
 
             setStatus(`Rendering ${count.toLocaleString()} parcels...`);
             // Yield to let status update paint before the heavy render
@@ -296,11 +310,7 @@
         // ── Slider ────────────────────────────────────────────────────────
 
         function initSlider() {
-            const vpaVals = allFeatures.map(f => f.properties._vpa).filter(v => v > 0);
-            let minVpa = Infinity, maxVpa = -Infinity;
-            for (const v of vpaVals) { if (v < minVpa) minVpa = v; if (v > maxVpa) maxVpa = v; }
-            vpaLogMin = Math.log10(minVpa);
-            vpaLogMax = Math.log10(maxVpa);
+            // vpaLogMin/vpaLogMax already set during load loop
 
             const minEl = document.getElementById('slider-min');
             const maxEl = document.getElementById('slider-max');
