@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tax Area by Parcel</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="container">
+        <div id="map"></div>
+
+        <div id="sidebar">
+            <div id="sidebar-header">
+                <div class="title-box">
+                    <h1>Tax Area by Parcel</h1>
+                    <div class="title-box-btm"></div>
+                </div>
+                <p id="status">Loading...</p>
+            </div>
+
+            <div id="sidebar-content">
+
+                <div id="range-filter">
+                    <div class="detail-label">Appraised Value / Acre</div>
+                    <div id="range-labels">
+                        <span id="range-min-label"></span>
+                        <span id="range-max-label"></span>
+                    </div>
+                    <div id="range-track-wrap">
+                        <div id="range-track">
+                            <div id="range-dim-left"></div>
+                            <div id="range-dim-right"></div>
+                        </div>
+                        <input type="range" id="slider-min" min="0" max="1000" value="0" step="1">
+                        <input type="range" id="slider-max" min="0" max="1000" value="1000" step="1">
+                    </div>
+                    <div id="range-hint">Drag to filter parcels</div>
+                </div>
+
+                <div id="stats">
+                    <div class="detail-label">Medians</div>
+                    <div id="stats-wichita"></div>
+                    <div id="stats-district" style="display:none"></div>
+                </div>
+
+                <div id="district-filter">
+                    <div id="district-filter-label">Filter by District</div>
+                    <div id="district-checkboxes">Loading...</div>
+                </div>
+
+                <div id="parcel-info" style="display:none">
+                    <div class="detail-label">Selected Parcel</div>
+                    <div id="parcel-details"></div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/flatgeobuf@3.30.0/dist/flatgeobuf-geojson.min.js"></script>
+    <script>
+
+        // ── Config ────────────────────────────────────────────────────────
+
+        // Breaks calibrated to actual Wichita distribution
+        // (median ~$810K/acre, 25th pct ~$416K, 75th pct ~$1.23M)
+        const BREAKS = [
+            { max:    100000, color: '#ffffb2', label: '< $100K' },
+            { max:    400000, color: '#fecc5c', label: '$100K – $400K' },
+            { max:    800000, color: '#fd8d3c', label: '$400K – $800K' },
+            { max:   1250000, color: '#f03b20', label: '$800K – $1.25M' },
+            { max:   2000000, color: '#bd0026', label: '$1.25M – $2M' },
+            { max:   Infinity, color: '#7f0000', label: '> $2M' },
+        ];
+        const NO_DATA_COLOR = '#cccccc';
+
+        // ── State ─────────────────────────────────────────────────────────
+
+        let map, renderer, parcelLayer;
+        let allFeatures = [];
+        let selectedDistricts = new Set(['All']);
+        let medians = {};  // { 'All': {vpa, vpsf}, '1': {vpa, vpsf}, ... }
+        let sliderMin = 0, sliderMax = 1;  // normalized 0–1 log scale
+        let vpaLogMin, vpaLogMax;          // log10 of actual min/max
+
+        // ── Map init ──────────────────────────────────────────────────────
+
+        function initMap() {
+            renderer = L.canvas({ padding: 0.5 });
+            map = L.map('map', { renderer }).setView([37.6872, -97.3301], 11);
+
+            L.tileLayer('https://tiles.stadiamaps.com/tiles/stamen_toner/{z}/{x}/{y}{r}.png?api_key=4f4c222f-cf1d-412d-a93a-e8bdaf1e4a3d', {
+                maxZoom: 20,
+                attribution: '&copy; <a href="https://stadiamaps.com/">Stadia Maps</a>, &copy; <a href="https://stamen.com/">Stamen Design</a>, &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+            }).addTo(map);
+
+            map.on('click', () => {
+                document.getElementById('parcel-info').style.display = 'none';
+            });
+        }
+
+        // ── Color ─────────────────────────────────────────────────────────
+
+        function getColor(vpa) {
+            if (vpa == null || isNaN(vpa) || vpa <= 0) return NO_DATA_COLOR;
+            for (const b of BREAKS) {
+                if (vpa < b.max) return b.color;
+            }
+            return BREAKS[BREAKS.length - 1].color;
+        }
+
+
+        // ── Load FlatGeobuf ───────────────────────────────────────────────
+
+        async function loadParcels() {
+            setStatus('Loading parcels...');
+
+            const response = await fetch('parcels.fgb');
+            if (!response.ok) throw new Error('parcels.fgb not found');
+
+            const districtNums = new Set();
+            let count = 0;
+
+            for await (const feature of flatgeobuf.deserialize(response.body)) {
+                const p = feature.properties;
+
+                // Value per acre
+                const acres = p.ParcAcresC || (p.ParcSqFTC ? p.ParcSqFTC / 43560 : null);
+                p._vpa = (acres && acres > 0 && p.apprTotal > 0) ? p.apprTotal / acres : null;
+
+                // Value per sq ft
+                const sqft = p.ParcSqFTC || (p.ParcAcresC ? p.ParcAcresC * 43560 : null);
+                p._vpsf = (sqft && sqft > 0 && p.apprTotal > 0) ? p.apprTotal / sqft : null;
+
+                if (p.district) districtNums.add(p.district);
+                allFeatures.push(feature);
+                count++;
+
+                if (count % 10000 === 0) {
+                    setStatus(`Loading... ${count.toLocaleString()} parcels`);
+                }
+            }
+
+            setStatus(`Rendering ${count.toLocaleString()} parcels...`);
+            // Yield to let status update paint before the heavy render
+            await new Promise(r => setTimeout(r, 0));
+
+            parcelLayer = L.geoJSON({ type: 'FeatureCollection', features: allFeatures }, {
+                renderer,
+                style(feature) {
+                    return {
+                        fillColor:   getColor(feature.properties._vpa),
+                        fillOpacity: 0.75,
+                        color:       '#555',
+                        weight:      0.5,
+                    };
+                },
+                onEachFeature(feature, layer) {
+                    layer.on('click', e => {
+                        L.DomEvent.stopPropagation(e);
+                        showParcelInfo(feature.properties);
+                    });
+                }
+            }).addTo(map);
+
+            map.fitBounds(parcelLayer.getBounds());
+            setStatus(`${count.toLocaleString()} parcels loaded`);
+
+            computeMedians();
+            updateStats();
+            initSlider();
+            buildDistrictCheckboxes([...districtNums].sort((a, b) => Number(a) - Number(b)));
+        }
+
+        // ── Medians ───────────────────────────────────────────────────────
+
+        function median(arr) {
+            if (!arr.length) return null;
+            const s = [...arr].sort((a, b) => a - b);
+            const m = Math.floor(s.length / 2);
+            return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+        }
+
+        function computeMedians() {
+            const byDistrict = {};
+            const allVpa = [], allVpsf = [];
+
+            for (const f of allFeatures) {
+                const p = f.properties;
+                if (p._vpa  != null) { allVpa.push(p._vpa);   (byDistrict[p.district] ??= { vpa: [], vpsf: [] }).vpa.push(p._vpa); }
+                if (p._vpsf != null) { allVpsf.push(p._vpsf); (byDistrict[p.district] ??= { vpa: [], vpsf: [] }).vpsf.push(p._vpsf); }
+            }
+
+            medians['All'] = { vpa: median(allVpa), vpsf: median(allVpsf) };
+            for (const [d, arrs] of Object.entries(byDistrict)) {
+                medians[d] = { vpa: median(arrs.vpa), vpsf: median(arrs.vpsf) };
+            }
+        }
+
+        function updateStats() {
+            const fmt  = n => n != null ? '$' + Math.round(n).toLocaleString() : '—';
+            const fmtf = n => n != null ? '$' + n.toFixed(2) : '—';
+
+            const w = medians['All'] ?? {};
+            document.getElementById('stats-wichita').innerHTML = `
+                <div class="stats-row"><span class="stats-label">Wichita</span></div>
+                <div class="stats-row"><span class="stats-key">Median/Acre</span><span class="stats-val">${fmt(w.vpa)}</span></div>
+                <div class="stats-row"><span class="stats-key">Median/Sq Ft</span><span class="stats-val">${fmtf(w.vpsf)}</span></div>
+            `;
+
+            const districtEl = document.getElementById('stats-district');
+            const isAll = selectedDistricts.has('All') || selectedDistricts.size === 0;
+
+            if (!isAll && selectedDistricts.size === 1) {
+                const d = [...selectedDistricts][0];
+                const dm = medians[d] ?? {};
+                districtEl.style.display = 'block';
+                districtEl.innerHTML = `
+                    <div class="stats-row"><span class="stats-label">District ${d}</span></div>
+                    <div class="stats-row"><span class="stats-key">Median/Acre</span><span class="stats-val">${fmt(dm.vpa)}</span></div>
+                    <div class="stats-row"><span class="stats-key">Median/Sq Ft</span><span class="stats-val">${fmtf(dm.vpsf)}</span></div>
+                `;
+            } else if (!isAll && selectedDistricts.size > 1) {
+                // Multiple districts selected — show combined median
+                const vpaVals = [], vpsfVals = [];
+                for (const d of selectedDistricts) {
+                    for (const f of allFeatures) {
+                        if (String(f.properties.district) === d) {
+                            if (f.properties._vpa  != null) vpaVals.push(f.properties._vpa);
+                            if (f.properties._vpsf != null) vpsfVals.push(f.properties._vpsf);
+                        }
+                    }
+                }
+                const names = [...selectedDistricts].sort((a,b) => Number(a)-Number(b)).join(', ');
+                districtEl.style.display = 'block';
+                districtEl.innerHTML = `
+                    <div class="stats-row"><span class="stats-label">Districts ${names}</span></div>
+                    <div class="stats-row"><span class="stats-key">Median/Acre</span><span class="stats-val">${fmt(median(vpaVals))}</span></div>
+                    <div class="stats-row"><span class="stats-key">Median/Sq Ft</span><span class="stats-val">${fmtf(median(vpsfVals))}</span></div>
+                `;
+            } else {
+                districtEl.style.display = 'none';
+            }
+        }
+
+        // ── Parcel info panel ─────────────────────────────────────────────
+
+        function showParcelInfo(p) {
+            document.getElementById('parcel-info').style.display = 'block';
+
+            const acres = p.ParcAcresC || (p.ParcSqFTC ? p.ParcSqFTC / 43560 : null);
+            const sqft  = p.ParcSqFTC  || (p.ParcAcresC ? p.ParcAcresC * 43560 : null);
+
+            const $   = n => (n != null && !isNaN(n) && n !== '') ? '$' + Math.round(n).toLocaleString() : '—';
+            const ac  = n => (n && n > 0) ? n.toFixed(3) + ' ac' : '—';
+            const sf  = n => (n && n > 0) ? Math.round(n).toLocaleString() + ' sq ft' : '—';
+            const vpa = n => (n && n > 0) ? '$' + Math.round(n).toLocaleString() + '/ac' : '—';
+            const vsf = n => (n && n > 0) ? '$' + n.toFixed(2) + '/sq ft' : '—';
+
+            document.getElementById('parcel-details').innerHTML = `
+                <div class="parcel-row"><span class="parcel-key">PIN</span><span class="parcel-val">${p.PIN ?? '—'}</span></div>
+                <div class="parcel-row"><span class="parcel-key">Address</span><span class="parcel-val">${p.address || '—'}</span></div>
+                <div class="parcel-row"><span class="parcel-key">Owner</span><span class="parcel-val">${p.owner || '—'}</span></div>
+                <div class="parcel-row"><span class="parcel-key">Owner Addr</span><span class="parcel-val">${p.ownerAdd || '—'}</span></div>
+                <div class="parcel-divider"></div>
+                <div class="parcel-row"><span class="parcel-key">App. Land</span><span class="parcel-val">${$(p.apprLand)}</span></div>
+                <div class="parcel-row"><span class="parcel-key">App. Bldg</span><span class="parcel-val">${$(p.apprBldg)}</span></div>
+                <div class="parcel-row"><span class="parcel-key">App. Total</span><span class="parcel-val">${$(p.apprTotal)}</span></div>
+                <div class="parcel-row"><span class="parcel-key">Assessed</span><span class="parcel-val">${$(p.assTotal)}</span></div>
+                <div class="parcel-divider"></div>
+                <div class="parcel-row"><span class="parcel-key">Area</span><span class="parcel-val">${ac(acres)}</span></div>
+                <div class="parcel-row"><span class="parcel-key">Area</span><span class="parcel-val">${sf(sqft)}</span></div>
+                <div class="parcel-row parcel-row--highlight"><span class="parcel-key">Value/Acre</span><span class="parcel-val">${vpa(p._vpa)}</span></div>
+                <div class="parcel-row parcel-row--highlight"><span class="parcel-key">Value/Sq Ft</span><span class="parcel-val">${vsf(p._vpsf)}</span></div>
+            `;
+        }
+
+        // ── Owner search ──────────────────────────────────────────────────
+
+
+        // ── Slider ────────────────────────────────────────────────────────
+
+        function initSlider() {
+            const vpaVals = allFeatures.map(f => f.properties._vpa).filter(v => v > 0);
+            let minVpa = Infinity, maxVpa = -Infinity;
+            for (const v of vpaVals) { if (v < minVpa) minVpa = v; if (v > maxVpa) maxVpa = v; }
+            vpaLogMin = Math.log10(minVpa);
+            vpaLogMax = Math.log10(maxVpa);
+
+            const minEl = document.getElementById('slider-min');
+            const maxEl = document.getElementById('slider-max');
+
+            minEl.value = 0;
+            maxEl.value = 1000;
+            updateSliderUI();
+
+            minEl.addEventListener('input', () => {
+                if (+minEl.value > +maxEl.value) minEl.value = maxEl.value;
+                sliderMin = +minEl.value / 1000;
+                updateSliderUI();
+                applyVisibility();
+            });
+            maxEl.addEventListener('input', () => {
+                if (+maxEl.value < +minEl.value) maxEl.value = minEl.value;
+                sliderMax = +maxEl.value / 1000;
+                updateSliderUI();
+                applyVisibility();
+            });
+        }
+
+        function sliderToVpa(t) {
+            // t is 0–1, mapped logarithmically to vpaLogMin–vpaLogMax
+            return Math.pow(10, vpaLogMin + t * (vpaLogMax - vpaLogMin));
+        }
+
+        function updateSliderUI() {
+            const minVal = sliderToVpa(sliderMin);
+            const maxVal = sliderToVpa(sliderMax);
+            const fmt = n => n >= 1e6
+                ? '$' + (n / 1e6).toFixed(1) + 'M'
+                : '$' + Math.round(n / 1000) + 'K';
+            document.getElementById('range-min-label').textContent = fmt(minVal);
+            document.getElementById('range-max-label').textContent = fmt(maxVal);
+
+            const pMin = sliderMin * 100;
+            const pMax = sliderMax * 100;
+            document.getElementById('range-dim-left').style.width  = pMin + '%';
+            document.getElementById('range-dim-right').style.width = (100 - pMax) + '%';
+        }
+
+        let rafPending = false;
+
+        function applyVisibility() {
+            if (!parcelLayer) return;
+            if (rafPending) return;
+            rafPending = true;
+            requestAnimationFrame(() => {
+                rafPending = false;
+                const lo = sliderToVpa(sliderMin);
+                const hi = sliderToVpa(sliderMax);
+                const isAll = selectedDistricts.has('All') || selectedDistricts.size === 0;
+
+                parcelLayer.eachLayer(layer => {
+                    const p = layer.feature.properties;
+                    const inRange    = p._vpa != null && p._vpa >= lo && p._vpa <= hi;
+                    const inDistrict = isAll || selectedDistricts.has(String(p.district ?? ''));
+                    const visible    = inRange && inDistrict;
+                    layer.setStyle(visible
+                        ? { fillColor: getColor(p._vpa), fillOpacity: 0.75, color: '#555', weight: 0.5 }
+                        : { fillOpacity: 0, color: 'transparent', weight: 0 }
+                    );
+                });
+            });
+        }
+
+        // ── District filter ───────────────────────────────────────────────
+
+        function buildDistrictCheckboxes(names) {
+            document.getElementById('district-checkboxes').innerHTML = `
+                <label class="district-check">
+                    <input type="checkbox" value="All" checked onchange="handleDistrictChange(this)"> All
+                </label>
+                ${names.map(n => `
+                <label class="district-check">
+                    <input type="checkbox" value="${n}" onchange="handleDistrictChange(this)"> District ${n}
+                </label>`).join('')}
+            `;
+        }
+
+        function handleDistrictChange(checkbox) {
+            if (checkbox.value === 'All') {
+                selectedDistricts = new Set(['All']);
+                document.querySelectorAll('#district-checkboxes input').forEach(cb => {
+                    cb.checked = checkbox.checked;
+                    if (cb.value !== 'All') selectedDistricts.add(cb.value);
+                });
+                if (!checkbox.checked) selectedDistricts = new Set();
+            } else {
+                selectedDistricts.delete('All');
+                document.querySelector('#district-checkboxes input[value="All"]').checked = false;
+                if (checkbox.checked) selectedDistricts.add(checkbox.value);
+                else selectedDistricts.delete(checkbox.value);
+            }
+            applyDistrictFilter();
+        }
+
+        function applyDistrictFilter() {
+            applyVisibility();
+            updateStats();
+        }
+
+        // ── Util ──────────────────────────────────────────────────────────
+
+        function setStatus(msg) {
+            document.getElementById('status').textContent = msg;
+        }
+
+        // ── Boot ──────────────────────────────────────────────────────────
+
+        document.addEventListener('DOMContentLoaded', () => {
+            initMap();
+            loadParcels().catch(err => {
+                console.error(err);
+                setStatus('Error: ' + err.message);
+            });
+        });
+
+    </script>
+</body>
+</html>
