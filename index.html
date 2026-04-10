@@ -343,7 +343,9 @@
             const maxVal = sliderToVpa(sliderMax);
             const fmt = n => n >= 1e6
                 ? '$' + (n / 1e6).toFixed(1) + 'M'
-                : '$' + Math.round(n / 1000) + 'K';
+                : n >= 1000
+                    ? '$' + Math.round(n / 1000) + 'K'
+                    : '$' + Math.round(n).toLocaleString();
             document.getElementById('range-min-label').textContent = fmt(minVal);
             document.getElementById('range-max-label').textContent = fmt(maxVal);
 
